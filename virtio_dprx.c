@@ -676,6 +676,22 @@ static void vdprx_remove(struct platform_device *pdev)
 	pr_info("Virtual Dprx removed\n");
 }
 
+#ifdef CONFIG_PM_SLEEP
+static int dprx_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int dprx_resume(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops dprx_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(dprx_suspend, dprx_resume)
+};
+
 static const struct of_device_id dprx_of_match[] = {
 	{ .compatible = "qcom,virtio-dprx" },
 	{ }
@@ -690,6 +706,7 @@ static struct platform_driver vdprx_platform_driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = dprx_of_match,
+		.pm = &dprx_pm_ops,
 	},
 };
 
