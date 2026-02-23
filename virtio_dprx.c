@@ -148,6 +148,9 @@ static struct virtio_dprx_session *virtio_dprx_session_alloc(
 	for (i = 0; i <= V4L2_BUF_TYPE_VIDEO_CAPTURE; i++)
 		INIT_LIST_HEAD(&session->queues[i].pending_dqbufs);
 
+	for (i = 0; i <= V4L2_BUF_TYPE_VIDEO_CAPTURE; i++)
+		atomic_set(&session->queues[i].pending_cnt, 0);
+
 	mutex_init(&session->queues_lock);
 	mutex_init(&session->dqbufs_lock);
 
@@ -300,6 +303,7 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	const enum v4l2_buf_type queue_type = dqbuf_evt->buffer.type;
 	struct virtio_dprx_queue_state *queue;
 	typeof(dqbuf->buffer.m) buffer_m;
+	__u32 preserved_length, preserved_memory;
 
 	if (queue_type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
 		pr_err("(%s) unmanaged queue %d passed to dqbuf event",
@@ -318,13 +322,25 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
 
+	/* Drop duplicate DQ event for the same buffer */
+	if (dqbuf->buffer.flags & V4L2_BUF_FLAG_DONE) {
+		pr_warn("(%s) duplicate DQBUF event for buf %u",
+				dev_name(&vdprx->video_dev.dev), dqbuf_evt->buffer.index);
+		return;
+	}
+
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
 	 * gets back the information it submitted.
 	 */
 	buffer_m = dqbuf->buffer.m;
+	preserved_length = dqbuf->buffer.length;
+	preserved_memory = dqbuf->buffer.memory;
+
 	memcpy(&dqbuf->buffer, &dqbuf_evt->buffer, sizeof(dqbuf->buffer));
 	dqbuf->buffer.m = buffer_m;
+	dqbuf->buffer.length = preserved_length;
+	dqbuf->buffer.memory = preserved_memory;
 
 	/* Handle DMA-BUF memory type */
 	if (dqbuf->buffer.memory == V4L2_MEMORY_DMABUF) {
@@ -332,11 +348,20 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	}
 
 	/* Set the DONE flag as the buffer is waiting for being dequeued. */
+	/* Transition QUEUED -> DONE and keep other bits intact */
+	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
 	mutex_lock(&session->dqbufs_lock);
+
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
-	queue->queued_bufs -= 1;
+	if (queue->queued_bufs > 0)
+		queue->queued_bufs -= 1;
+	else
+		pr_warn("(%s) queued_bufs underflow on DQBUF event", dev_name(&vdprx->video_dev.dev));
+
+	atomic_inc(&queue->pending_cnt);
+
 	mutex_unlock(&session->dqbufs_lock);
 	wake_up(&session->dqbuf_wait);
 }
@@ -400,16 +425,6 @@ end_of_event:
 	mutex_unlock(&vdprx->events_lock);
 }
 
-/**
-* Event callback. This processes the event
-*/
-static void virtio_dprx_event_work(struct work_struct *work)
-{
-	struct virtual_dprx_dev *vdprx = container_of(work, struct virtual_dprx_dev, eventq_work);
-
-	virtio_dprx_process_events(vdprx);
-}
-
 /*
  * poll for a virtio-dprx device.
 */
@@ -434,7 +449,7 @@ static __poll_t virtio_dprx_device_poll(struct file *file, poll_table *wait)
 		if (!capture_queue->streaming) {
 			// Streaming not started: do NOT signal error, just return 0
 			pr_debug("poll: streaming not active, blocking...");
-		} else if (!list_empty(&capture_queue->pending_dqbufs)) {
+		} else if (atomic_read(&capture_queue->pending_cnt) > 0) {
 			rc |= EPOLLIN | EPOLLRDNORM;
 		}
 		// If streaming is active but no buffers ready, return 0 (block)
@@ -583,7 +598,6 @@ static int vdprx_probe(struct platform_device *pdev)
 	mutex_init(&vdprx->sessions_lock);
 
 	mutex_init(&vdprx->events_lock);
-	INIT_WORK(&vdprx->eventq_work, virtio_dprx_event_work);
 
 	mutex_init(&vdprx->vlock);
 

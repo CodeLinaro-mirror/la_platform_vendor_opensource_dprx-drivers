@@ -414,6 +414,7 @@ static void virtio_dprx_clear_queue( struct virtual_dprx_dev *vdprx,
 
 	pr_info("virtio_dprx_clear_queue called list del\n");
 	/* All buffers are now dequeued. */
+	atomic_set(&queue->pending_cnt, 0);
 	for (i = 0; i < queue->allocated_bufs; i++) {
 		queue->buffers[i].buffer.flags = 0;
 		virtio_dprx_unexport_memory(vdprx, &queue->buffers[i]);
@@ -705,12 +706,22 @@ static int virtio_dprx_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	}
 
 	pr_debug(" virtio_dprx_qbuf shmem_id %d", buffer->shmem_id);
+
+	mutex_lock(&session->dqbufs_lock);
 	old_flags = buffer->buffer.flags;
-	buffer->buffer.flags = V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED;
+	buffer->buffer.flags &= ~(V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_ERROR);
+	buffer->buffer.flags |= (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED);
+	queue->queued_bufs++;
+	mutex_unlock(&session->dqbufs_lock);
+
 	ret = virtio_dprx_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
 	if (ret) {
 		/* Rollback the previous flags as the buffer is not queued. */
+		mutex_lock(&session->dqbufs_lock);
 		buffer->buffer.flags = old_flags;
+		if (queue->queued_bufs > 0)
+			queue->queued_bufs--;
+		mutex_unlock(&session->dqbufs_lock);
 		return ret;
 	}
 
@@ -742,9 +753,8 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		return -EPIPE;
 
 	buffer_queue = &queue->pending_dqbufs;
-
 	if (session->nonblocking_dequeue) {
-		if (list_empty(buffer_queue))
+		if (atomic_read(&queue->pending_cnt) == 0)
 			return -EAGAIN;
 	} else if (queue->allocated_bufs == 0) {
 		return -EINVAL;
@@ -759,16 +769,25 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 	 */
 	mutex_unlock(&vdprx->vlock);
 	ret = wait_event_interruptible(session->dqbuf_wait,
-				       !list_empty(buffer_queue));
-	mutex_lock(&vdprx->vlock);
+			atomic_read(&queue->pending_cnt) > 0);
 	if (ret)
-		return -EINTR;
+		goto relock_vlock_eintr;
 
-	mutex_lock(&session->queues_lock);
+	/* Pop exactly one buffer from the pending list under the producer's lock */
+	mutex_lock(&session->dqbufs_lock);
+	if (list_empty(buffer_queue)) {
+		mutex_unlock(&session->dqbufs_lock);
+		/* Rare race: condition flipped between wake and pop. */
+		goto relock_vlock_eagain;
+	}
 	dqbuf = list_first_entry(buffer_queue, struct virtio_dprx_buffer,
-				 list);
+			list);
 	list_del(&dqbuf->list);
-	mutex_unlock(&session->queues_lock);
+	atomic_dec(&queue->pending_cnt);
+	mutex_unlock(&session->dqbufs_lock);
+
+	/* Reacquire vlock after list ops to avoid lock ordering issues */
+	mutex_lock(&vdprx->vlock);
 
 	/* Clear the DONE flag as the buffer is now being dequeued. */
 	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
@@ -779,6 +798,13 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		queue->is_capture_last = true;
 
 	return 0;
+
+relock_vlock_eagain:
+	mutex_lock(&vdprx->vlock);
+	return -EAGAIN;
+relock_vlock_eintr:
+	mutex_lock(&vdprx->vlock);
+	return -EINTR;
 }
 
 static int virtio_dprx_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)

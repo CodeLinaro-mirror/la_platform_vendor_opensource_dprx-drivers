@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/videodev2.h>
+#include <linux/atomic.h>
 #include <linux/fs.h>
 #include <linux/vmalloc.h>
 #include <linux/mutex.h>
@@ -72,6 +73,7 @@ struct virtio_dprx_queue_state {
 	struct virtio_dprx_buffer *buffers;
 	size_t queued_bufs;
 	struct list_head pending_dqbufs;
+	atomic_t pending_cnt;
 };
 
 struct virtio_dprx_session {
