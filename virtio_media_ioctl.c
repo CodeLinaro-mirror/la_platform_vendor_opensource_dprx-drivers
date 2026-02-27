@@ -14,13 +14,13 @@
 #define DPRX_NAME "virtio-dprx"
 
 #define PRINT_IOCTL(cmd) \
-	pr_info("IOCTL: %s (raw=0x%lx type=0x%x nr=%u dir=%s size=%u)\n", \
+	pr_debug("IOCTL: %s (raw=0x%lx type=%lu nr=%lu dir=%s size=%lu)\n", \
 	ioctl_to_str(cmd), \
 	(unsigned long)(cmd), \
-	_IOC_TYPE(cmd), \
-	_IOC_NR(cmd), \
+	(unsigned long)_IOC_TYPE(cmd), \
+	(unsigned long)_IOC_NR(cmd), \
 	ioc_dir_to_str(_IOC_DIR(cmd)), \
-	_IOC_SIZE(cmd))
+	(unsigned long)_IOC_SIZE(cmd))
 
 const char *ioctl_to_str(unsigned long cmd)
 {
@@ -277,6 +277,8 @@ static int virtio_dprx_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		kfree(cmd_ioctl);
 		return -ENOMEM;
 	}
+
+	PRINT_IOCTL(ioctl);
 
 	char *uuid = (char *)cmd_ioctl + sizeof(struct virtio_media_cmd_ioctl) + sizeof(struct v4l2_buffer);
 
@@ -699,7 +701,7 @@ static int virtio_dprx_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	if (!buffer->shmem_id) {
 		ret = virtio_dprx_export_memory(vdprx, buffer);
 		if (ret) {
-			pr_err("buffer memory export failed \n");
+			pr_err(" virtio_dprx_qbuf : buffer memory export failed \n");
 			dma_buf_put(buffer->dbuf);
 			return ret;
 		}
@@ -713,6 +715,7 @@ static int virtio_dprx_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	buffer->buffer.flags |= (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED);
 	queue->queued_bufs++;
 	mutex_unlock(&session->dqbufs_lock);
+
 
 	ret = virtio_dprx_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
 	if (ret) {
@@ -762,6 +765,7 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		return -EINVAL;
 	}
 
+	PRINT_IOCTL(VIDIOC_DQBUF);
 	/*
 	 * vd->lock has been acquired by virtio_dprx_device_ioctl. Release it
 	 * while we want to other ioctls for this session can be processed and
@@ -936,5 +940,6 @@ long virtio_dprx_device_ioctl(struct file *file, unsigned int cmd,
 
 	mutex_unlock(&vdprx->vlock);
 
+	vdprx_trace_ioctl_record(vdprx, cmd, ret);
 	return ret;
 }

@@ -305,6 +305,7 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	typeof(dqbuf->buffer.m) buffer_m;
 	__u32 preserved_length, preserved_memory;
 
+
 	if (queue_type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
 		pr_err("(%s) unmanaged queue %d passed to dqbuf event",
 				dev_name(&vdprx->video_dev.dev),
@@ -326,7 +327,7 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	if (dqbuf->buffer.flags & V4L2_BUF_FLAG_DONE) {
 		pr_warn("(%s) duplicate DQBUF event for buf %u",
 				dev_name(&vdprx->video_dev.dev), dqbuf_evt->buffer.index);
-		return;
+	return;
 	}
 
 	/*
@@ -359,7 +360,6 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 		queue->queued_bufs -= 1;
 	else
 		pr_warn("(%s) queued_bufs underflow on DQBUF event", dev_name(&vdprx->video_dev.dev));
-
 	atomic_inc(&queue->pending_cnt);
 
 	mutex_unlock(&session->dqbufs_lock);
@@ -378,7 +378,6 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 	mutex_lock(&vdprx->events_lock);
 	if ((evt = virtio_dprx_get_event_buffer(vdprx))) {
 		pr_debug("event received %s \n", event_id_to_string(evt));
-
 		session = virtio_dprx_find_session(vdprx, evt->session_id);
 		if (session == NULL) {
 			pr_err("cannot find session %d\n",
@@ -388,6 +387,10 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 		switch (evt->event) {
 		case VIRTIO_MEDIA_EVT_ERROR:
 			error_evt = (struct virtio_media_event_error *)evt;
+
+			vdprx_trace_event_record(vdprx, V4L2_EVENT_PRIVATE_START,
+                                     error_evt->hdr.session_id, error_evt->errno);
+
 			pr_err("received error %d for session %d \n",
 				error_evt->errno, error_evt->hdr.session_id);
 			struct v4l2_event v4l2_err_evt = {
@@ -401,12 +404,22 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 			break;
 		case VIRTIO_MEDIA_EVT_DQBUF:
 			dqbuf_evt = (struct virtio_media_event_dqbuf *)evt;
+
+			vdprx_trace_event_record(vdprx, VIRTIO_MEDIA_EVT_DQBUF,
+					dqbuf_evt->hdr.session_id,
+					dqbuf_evt->buffer.index);
+
 			virtio_dprx_process_dqbuf_event(vdprx, session, dqbuf_evt);
 			len = sizeof(struct virtio_media_event_dqbuf);
 			memset((char *)evt, 0x00, len);
 			break;
 		case VIRTIO_MEDIA_EVT_EVENT:
 			event_evt = (struct virtio_media_event_event *)evt;
+
+			vdprx_trace_event_record(vdprx, V4L2_EVENT_SOURCE_CHANGE,
+					event_evt->hdr.session_id,
+					V4L2_EVENT_SRC_CH_RESOLUTION);
+
 			struct v4l2_event event = {
 				.type = V4L2_EVENT_SOURCE_CHANGE,
 				.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
@@ -456,7 +469,6 @@ static __poll_t virtio_dprx_device_poll(struct file *file, poll_table *wait)
 	}
 
 	mutex_unlock(&session->dqbufs_lock);
-
 	if (v4l2_event_pending(&session->fh)) {
 		pr_info("Event in the Queue");
 		rc |= EPOLLPRI;
@@ -641,6 +653,13 @@ static int vdprx_probe(struct platform_device *pdev)
 		sysfs_remove_group(&pdev->dev.kobj, &vdprx_attr_group);
 		goto video_unreg;
 	}
+
+	ret = vdprx_debugfs_create(vdprx);
+	if (ret) {
+		dev_warn(dev, "DebugFS not available (%d); continuing without it\n", ret);
+		/* not fatal */
+	}
+
 	module_removed = false;
 
 	vdprx->stop = false;
@@ -680,6 +699,8 @@ static void vdprx_remove(struct platform_device *pdev)
 
 	snprintf(link_name, sizeof(link_name), "dprx_card%d", vdprx->device_id);
 	sysfs_remove_link(kernel_kobj, link_name);
+
+    vdprx_debugfs_remove(vdprx);
 
 	// Remove sysfs attributes
 	sysfs_remove_group(&pdev->dev.kobj, &vdprx_attr_group);
