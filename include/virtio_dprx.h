@@ -31,7 +31,8 @@
 #define DRIVER_NAME "v4l2_virtual_dprx"
 #define MAX_DPRX_DEVICES 2
 
-#define PIXEL_FORMAT_RGB24 V4L2_PIX_FMT_RGB24
+#define PIXEL_FORMAT_BGR24 V4L2_PIX_FMT_RGB24
+#define PIXEL_FORMAT_RGB24 V4L2_PIX_FMT_BGR24
 #define PIXEL_FORMAT_RGB101010 v4l2_fourcc('R', '1', '0', ' ') // Define RGB101010 format
 #define PIXEL_FORMAT_RGB888_UBWC v4l2_fourcc('Q', 'R', 'U', '3') // RGB888 UBWC format
 

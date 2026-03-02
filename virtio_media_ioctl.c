@@ -819,10 +819,15 @@ static int virtio_dprx_enum_fmt_vid_cap(struct file *file, void *priv, struct v4
 		strscpy(f->description, "RGB24", sizeof(f->description));
 		break;
 	case 1:
+		f->pixelformat = PIXEL_FORMAT_BGR24;
+		strscpy(f->description, "BGR24", sizeof(f->description));
+		break;
+
+	case 2:
 		f->pixelformat = PIXEL_FORMAT_RGB101010;
 		strscpy(f->description, "RGB101010", sizeof(f->description));
 		break;
-	case 2:
+	case 3:
 		f->pixelformat = PIXEL_FORMAT_RGB888_UBWC;
 		strscpy(f->description, "RGB888 UBWC", sizeof(f->description));
 		break;
@@ -859,13 +864,15 @@ static int virtio_dprx_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_
 	int ret = 0;
 
 	if (f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB24 &&
+		f->fmt.pix.pixelformat != PIXEL_FORMAT_BGR24 &&
 		f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB101010 &&
 		f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB888_UBWC)
 		return -EINVAL;
 
 	vdprx->format = *f;
 
-	if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB24) {
+	if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB24 ||
+			f->fmt.pix.pixelformat == PIXEL_FORMAT_BGR24) {
 		vdprx->format.fmt.pix.bytesperline = f->fmt.pix.width * 3;
 		vdprx->format.fmt.pix.sizeimage = f->fmt.pix.width * f->fmt.pix.height * 3;
 	} else if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB101010) {
