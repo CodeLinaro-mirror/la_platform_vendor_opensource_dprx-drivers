@@ -1,0 +1,29 @@
+load("//build/kernel/kleaf:kernel.bzl", "ddk_headers")
+
+package(
+    default_visibility = [
+      "//visibility:public"],
+)
+
+ddk_headers(
+    name = "linux_includes",
+    hdrs = glob([
+      "include/linux/*.h",
+    ]),
+    includes = ["include"]
+)
+ddk_headers(
+     name = "dprx_headers",
+     hdrs = glob([
+       "include/*.h",
+     ]),
+     includes = ["include"]
+)
+
+ddk_headers(
+    name = "dprx_drivers_headers",
+    hdrs = [ ":linux_includes", ":dprx_headers"]
+)
+
+load(":nordau.bzl", "define_nordau")
+define_nordau()
