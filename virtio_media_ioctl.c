@@ -14,13 +14,13 @@
 #define DPRX_NAME "virtio-dprx"
 
 #define PRINT_IOCTL(cmd) \
-	pr_info("IOCTL: %s (raw=0x%lx type=0x%x nr=%u dir=%s size=%u)\n", \
+	pr_debug("IOCTL: %s (raw=0x%lx type=%lu nr=%lu dir=%s size=%lu)\n", \
 	ioctl_to_str(cmd), \
 	(unsigned long)(cmd), \
-	_IOC_TYPE(cmd), \
-	_IOC_NR(cmd), \
+	(unsigned long)_IOC_TYPE(cmd), \
+	(unsigned long)_IOC_NR(cmd), \
 	ioc_dir_to_str(_IOC_DIR(cmd)), \
-	_IOC_SIZE(cmd))
+	(unsigned long)_IOC_SIZE(cmd))
 
 const char *ioctl_to_str(unsigned long cmd)
 {
@@ -278,6 +278,8 @@ static int virtio_dprx_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		return -ENOMEM;
 	}
 
+	PRINT_IOCTL(ioctl);
+
 	char *uuid = (char *)cmd_ioctl + sizeof(struct virtio_media_cmd_ioctl) + sizeof(struct v4l2_buffer);
 
 	cmd_ioctl->hdr.cmd = VIRTIO_MEDIA_CMD_IOCTL;
@@ -414,6 +416,7 @@ static void virtio_dprx_clear_queue( struct virtual_dprx_dev *vdprx,
 
 	pr_info("virtio_dprx_clear_queue called list del\n");
 	/* All buffers are now dequeued. */
+	atomic_set(&queue->pending_cnt, 0);
 	for (i = 0; i < queue->allocated_bufs; i++) {
 		queue->buffers[i].buffer.flags = 0;
 		virtio_dprx_unexport_memory(vdprx, &queue->buffers[i]);
@@ -698,19 +701,30 @@ static int virtio_dprx_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	if (!buffer->shmem_id) {
 		ret = virtio_dprx_export_memory(vdprx, buffer);
 		if (ret) {
-			pr_err("buffer memory export failed \n");
+			pr_err(" virtio_dprx_qbuf : buffer memory export failed \n");
 			dma_buf_put(buffer->dbuf);
 			return ret;
 		}
 	}
 
 	pr_debug(" virtio_dprx_qbuf shmem_id %d", buffer->shmem_id);
+
+	mutex_lock(&session->dqbufs_lock);
 	old_flags = buffer->buffer.flags;
-	buffer->buffer.flags = V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED;
+	buffer->buffer.flags &= ~(V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_ERROR);
+	buffer->buffer.flags |= (V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_PREPARED);
+	queue->queued_bufs++;
+	mutex_unlock(&session->dqbufs_lock);
+
+
 	ret = virtio_dprx_send_buffer_ioctl(fh, VIDIOC_QBUF, b);
 	if (ret) {
 		/* Rollback the previous flags as the buffer is not queued. */
+		mutex_lock(&session->dqbufs_lock);
 		buffer->buffer.flags = old_flags;
+		if (queue->queued_bufs > 0)
+			queue->queued_bufs--;
+		mutex_unlock(&session->dqbufs_lock);
 		return ret;
 	}
 
@@ -742,9 +756,8 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		return -EPIPE;
 
 	buffer_queue = &queue->pending_dqbufs;
-
 	if (session->nonblocking_dequeue) {
-		if (list_empty(buffer_queue))
+		if (atomic_read(&queue->pending_cnt) == 0)
 			return -EAGAIN;
 	} else if (queue->allocated_bufs == 0) {
 		return -EINVAL;
@@ -752,6 +765,7 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		return -EINVAL;
 	}
 
+	PRINT_IOCTL(VIDIOC_DQBUF);
 	/*
 	 * vd->lock has been acquired by virtio_dprx_device_ioctl. Release it
 	 * while we want to other ioctls for this session can be processed and
@@ -759,16 +773,25 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 	 */
 	mutex_unlock(&vdprx->vlock);
 	ret = wait_event_interruptible(session->dqbuf_wait,
-				       !list_empty(buffer_queue));
-	mutex_lock(&vdprx->vlock);
+			atomic_read(&queue->pending_cnt) > 0);
 	if (ret)
-		return -EINTR;
+		goto relock_vlock_eintr;
 
-	mutex_lock(&session->queues_lock);
+	/* Pop exactly one buffer from the pending list under the producer's lock */
+	mutex_lock(&session->dqbufs_lock);
+	if (list_empty(buffer_queue)) {
+		mutex_unlock(&session->dqbufs_lock);
+		/* Rare race: condition flipped between wake and pop. */
+		goto relock_vlock_eagain;
+	}
 	dqbuf = list_first_entry(buffer_queue, struct virtio_dprx_buffer,
-				 list);
+			list);
 	list_del(&dqbuf->list);
-	mutex_unlock(&session->queues_lock);
+	atomic_dec(&queue->pending_cnt);
+	mutex_unlock(&session->dqbufs_lock);
+
+	/* Reacquire vlock after list ops to avoid lock ordering issues */
+	mutex_lock(&vdprx->vlock);
 
 	/* Clear the DONE flag as the buffer is now being dequeued. */
 	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
@@ -779,6 +802,13 @@ static int virtio_dprx_dqbuf(struct file *file, void *fh,
 		queue->is_capture_last = true;
 
 	return 0;
+
+relock_vlock_eagain:
+	mutex_lock(&vdprx->vlock);
+	return -EAGAIN;
+relock_vlock_eintr:
+	mutex_lock(&vdprx->vlock);
+	return -EINTR;
 }
 
 static int virtio_dprx_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
@@ -789,10 +819,15 @@ static int virtio_dprx_enum_fmt_vid_cap(struct file *file, void *priv, struct v4
 		strscpy(f->description, "RGB24", sizeof(f->description));
 		break;
 	case 1:
+		f->pixelformat = PIXEL_FORMAT_BGR24;
+		strscpy(f->description, "BGR24", sizeof(f->description));
+		break;
+
+	case 2:
 		f->pixelformat = PIXEL_FORMAT_RGB101010;
 		strscpy(f->description, "RGB101010", sizeof(f->description));
 		break;
-	case 2:
+	case 3:
 		f->pixelformat = PIXEL_FORMAT_RGB888_UBWC;
 		strscpy(f->description, "RGB888 UBWC", sizeof(f->description));
 		break;
@@ -829,13 +864,15 @@ static int virtio_dprx_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_
 	int ret = 0;
 
 	if (f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB24 &&
+		f->fmt.pix.pixelformat != PIXEL_FORMAT_BGR24 &&
 		f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB101010 &&
 		f->fmt.pix.pixelformat != PIXEL_FORMAT_RGB888_UBWC)
 		return -EINVAL;
 
 	vdprx->format = *f;
 
-	if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB24) {
+	if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB24 ||
+			f->fmt.pix.pixelformat == PIXEL_FORMAT_BGR24) {
 		vdprx->format.fmt.pix.bytesperline = f->fmt.pix.width * 3;
 		vdprx->format.fmt.pix.sizeimage = f->fmt.pix.width * f->fmt.pix.height * 3;
 	} else if (f->fmt.pix.pixelformat == PIXEL_FORMAT_RGB101010) {
@@ -910,5 +947,6 @@ long virtio_dprx_device_ioctl(struct file *file, unsigned int cmd,
 
 	mutex_unlock(&vdprx->vlock);
 
+	vdprx_trace_ioctl_record(vdprx, cmd, ret);
 	return ret;
 }

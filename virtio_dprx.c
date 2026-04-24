@@ -148,6 +148,9 @@ static struct virtio_dprx_session *virtio_dprx_session_alloc(
 	for (i = 0; i <= V4L2_BUF_TYPE_VIDEO_CAPTURE; i++)
 		INIT_LIST_HEAD(&session->queues[i].pending_dqbufs);
 
+	for (i = 0; i <= V4L2_BUF_TYPE_VIDEO_CAPTURE; i++)
+		atomic_set(&session->queues[i].pending_cnt, 0);
+
 	mutex_init(&session->queues_lock);
 	mutex_init(&session->dqbufs_lock);
 
@@ -300,6 +303,8 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	const enum v4l2_buf_type queue_type = dqbuf_evt->buffer.type;
 	struct virtio_dprx_queue_state *queue;
 	typeof(dqbuf->buffer.m) buffer_m;
+	__u32 preserved_length, preserved_memory;
+
 
 	if (queue_type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
 		pr_err("(%s) unmanaged queue %d passed to dqbuf event",
@@ -318,13 +323,25 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
 
+	/* Drop duplicate DQ event for the same buffer */
+	if (dqbuf->buffer.flags & V4L2_BUF_FLAG_DONE) {
+		pr_warn("(%s) duplicate DQBUF event for buf %u",
+				dev_name(&vdprx->video_dev.dev), dqbuf_evt->buffer.index);
+	return;
+	}
+
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
 	 * gets back the information it submitted.
 	 */
 	buffer_m = dqbuf->buffer.m;
+	preserved_length = dqbuf->buffer.length;
+	preserved_memory = dqbuf->buffer.memory;
+
 	memcpy(&dqbuf->buffer, &dqbuf_evt->buffer, sizeof(dqbuf->buffer));
 	dqbuf->buffer.m = buffer_m;
+	dqbuf->buffer.length = preserved_length;
+	dqbuf->buffer.memory = preserved_memory;
 
 	/* Handle DMA-BUF memory type */
 	if (dqbuf->buffer.memory == V4L2_MEMORY_DMABUF) {
@@ -332,11 +349,19 @@ static void virtio_dprx_process_dqbuf_event(struct virtual_dprx_dev *vdprx,
 	}
 
 	/* Set the DONE flag as the buffer is waiting for being dequeued. */
+	/* Transition QUEUED -> DONE and keep other bits intact */
+	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
 	mutex_lock(&session->dqbufs_lock);
+
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
-	queue->queued_bufs -= 1;
+	if (queue->queued_bufs > 0)
+		queue->queued_bufs -= 1;
+	else
+		pr_warn("(%s) queued_bufs underflow on DQBUF event", dev_name(&vdprx->video_dev.dev));
+	atomic_inc(&queue->pending_cnt);
+
 	mutex_unlock(&session->dqbufs_lock);
 	wake_up(&session->dqbuf_wait);
 }
@@ -353,7 +378,6 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 	mutex_lock(&vdprx->events_lock);
 	if ((evt = virtio_dprx_get_event_buffer(vdprx))) {
 		pr_debug("event received %s \n", event_id_to_string(evt));
-
 		session = virtio_dprx_find_session(vdprx, evt->session_id);
 		if (session == NULL) {
 			pr_err("cannot find session %d\n",
@@ -363,6 +387,10 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 		switch (evt->event) {
 		case VIRTIO_MEDIA_EVT_ERROR:
 			error_evt = (struct virtio_media_event_error *)evt;
+
+			vdprx_trace_event_record(vdprx, V4L2_EVENT_PRIVATE_START,
+                                     error_evt->hdr.session_id, error_evt->errno);
+
 			pr_err("received error %d for session %d \n",
 				error_evt->errno, error_evt->hdr.session_id);
 			struct v4l2_event v4l2_err_evt = {
@@ -376,12 +404,22 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 			break;
 		case VIRTIO_MEDIA_EVT_DQBUF:
 			dqbuf_evt = (struct virtio_media_event_dqbuf *)evt;
+
+			vdprx_trace_event_record(vdprx, VIRTIO_MEDIA_EVT_DQBUF,
+					dqbuf_evt->hdr.session_id,
+					dqbuf_evt->buffer.index);
+
 			virtio_dprx_process_dqbuf_event(vdprx, session, dqbuf_evt);
 			len = sizeof(struct virtio_media_event_dqbuf);
 			memset((char *)evt, 0x00, len);
 			break;
 		case VIRTIO_MEDIA_EVT_EVENT:
 			event_evt = (struct virtio_media_event_event *)evt;
+
+			vdprx_trace_event_record(vdprx, V4L2_EVENT_SOURCE_CHANGE,
+					event_evt->hdr.session_id,
+					V4L2_EVENT_SRC_CH_RESOLUTION);
+
 			struct v4l2_event event = {
 				.type = V4L2_EVENT_SOURCE_CHANGE,
 				.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
@@ -398,16 +436,6 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 	}
 end_of_event:
 	mutex_unlock(&vdprx->events_lock);
-}
-
-/**
-* Event callback. This processes the event
-*/
-static void virtio_dprx_event_work(struct work_struct *work)
-{
-	struct virtual_dprx_dev *vdprx = container_of(work, struct virtual_dprx_dev, eventq_work);
-
-	virtio_dprx_process_events(vdprx);
 }
 
 /*
@@ -434,14 +462,13 @@ static __poll_t virtio_dprx_device_poll(struct file *file, poll_table *wait)
 		if (!capture_queue->streaming) {
 			// Streaming not started: do NOT signal error, just return 0
 			pr_debug("poll: streaming not active, blocking...");
-		} else if (!list_empty(&capture_queue->pending_dqbufs)) {
+		} else if (atomic_read(&capture_queue->pending_cnt) > 0) {
 			rc |= EPOLLIN | EPOLLRDNORM;
 		}
 		// If streaming is active but no buffers ready, return 0 (block)
 	}
 
 	mutex_unlock(&session->dqbufs_lock);
-
 	if (v4l2_event_pending(&session->fh)) {
 		pr_info("Event in the Queue");
 		rc |= EPOLLPRI;
@@ -583,7 +610,6 @@ static int vdprx_probe(struct platform_device *pdev)
 	mutex_init(&vdprx->sessions_lock);
 
 	mutex_init(&vdprx->events_lock);
-	INIT_WORK(&vdprx->eventq_work, virtio_dprx_event_work);
 
 	mutex_init(&vdprx->vlock);
 
@@ -627,6 +653,13 @@ static int vdprx_probe(struct platform_device *pdev)
 		sysfs_remove_group(&pdev->dev.kobj, &vdprx_attr_group);
 		goto video_unreg;
 	}
+
+	ret = vdprx_debugfs_create(vdprx);
+	if (ret) {
+		dev_warn(dev, "DebugFS not available (%d); continuing without it\n", ret);
+		/* not fatal */
+	}
+
 	module_removed = false;
 
 	vdprx->stop = false;
@@ -667,6 +700,8 @@ static void vdprx_remove(struct platform_device *pdev)
 	snprintf(link_name, sizeof(link_name), "dprx_card%d", vdprx->device_id);
 	sysfs_remove_link(kernel_kobj, link_name);
 
+    vdprx_debugfs_remove(vdprx);
+
 	// Remove sysfs attributes
 	sysfs_remove_group(&pdev->dev.kobj, &vdprx_attr_group);
 
@@ -675,6 +710,22 @@ static void vdprx_remove(struct platform_device *pdev)
 
 	pr_info("Virtual Dprx removed\n");
 }
+
+#ifdef CONFIG_PM_SLEEP
+static int dprx_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int dprx_resume(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops dprx_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(dprx_suspend, dprx_resume)
+};
 
 static const struct of_device_id dprx_of_match[] = {
 	{ .compatible = "qcom,virtio-dprx" },
@@ -690,6 +741,7 @@ static struct platform_driver vdprx_platform_driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = dprx_of_match,
+		.pm = &dprx_pm_ops,
 	},
 };
 

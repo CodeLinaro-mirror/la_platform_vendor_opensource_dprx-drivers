@@ -11,6 +11,7 @@ module_entry(
            "virtio_dprx.c",
            "virtio_dprx_virtq.c",
            "virtio_media_ioctl.c",
+	   "virtio_dprx_debugfs.c"
 	   ],
 )
 
